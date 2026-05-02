@@ -1,0 +1,34 @@
+{
+  "name": "watch2gether",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "run-p dev:*",
+    "dev:next": "next dev",
+    "dev:party": "partykit dev",
+    "build": "next build",
+    "start": "next start",
+    "deploy:party": "partykit deploy",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "next": "16.2.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.4",
+    "npm-run-all2": "^8.0.4",
+    "partykit": "^0.0.115",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
