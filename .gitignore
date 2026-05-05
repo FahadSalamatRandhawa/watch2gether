@@ -38,6 +38,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# partykit dev local state
+/.partykit/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

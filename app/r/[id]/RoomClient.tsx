@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { partyHttpUrl, partyWsUrl } from '@/lib/partykit';
+import { clearHandle, loadHandle, pickVideoFile, saveHandle } from '@/lib/file-handle-store';
 
 type Member = { peerId: string; nickname: string };
 type VideoMeta = { name: string; size: number; durationMs: number };
@@ -30,14 +31,13 @@ const ICE_SERVERS: RTCIceServer[] = [
 ];
 
 // Tuning for movie viewing: prefer crisp picture over real-time latency.
-const VIDEO_MAX_BITRATE = 5_000_000; // 5 Mbps cap; WebRTC adapts down on congestion.
+const VIDEO_MAX_BITRATE = 8_000_000; // 8 Mbps ceiling; WebRTC adapts down per peer.
 const AUDIO_MAX_BITRATE = 128_000;   // 128 kbps Opus
-const GUEST_PLAYOUT_DELAY_S = 1.0;   // ~1s jitter buffer on guest side
+const GUEST_PLAYOUT_DELAY_S = 1.5;   // 1.5s jitter buffer on guest side; absorbs more network jitter
 
 export default function RoomClient({ roomId }: { roomId: string }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const lastChatRef = useRef<HTMLDivElement | null>(null);
 
   // Host: stream captured from local video element
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -71,11 +71,13 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   const [chat, setChat] = useState<ChatMsg[]>([]);
   const [chatDraft, setChatDraft] = useState('');
   const [linkCopied, setLinkCopied] = useState(false);
-  const [showChat, setShowChat] = useState(true);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Host-only
   const [localFile, setLocalFile] = useState<File | null>(null);
   const [localFileURL, setLocalFileURL] = useState<string | null>(null);
+  const [savedHandle, setSavedHandle] = useState<FileSystemFileHandle | null>(null);
+  const [pickError, setPickError] = useState<string | null>(null);
 
   // Guest-only
   const [hasRemoteStream, setHasRemoteStream] = useState(false);
@@ -95,6 +97,15 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     setNickname(saved);
     if (saved) setNicknameSubmitted(true);
   }, []);
+
+  // Look up a previously saved file handle for this room (host-only utility).
+  useEffect(() => {
+    let cancelled = false;
+    loadHandle(roomId)
+      .then((h) => { if (!cancelled) setSavedHandle(h); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [roomId]);
 
   // Pre-check that the room exists before showing the join form.
   // The creator side has a localStorage flag and skips this check.
@@ -159,6 +170,27 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     }
   }, []);
 
+  const preferVideoCodecs = useCallback((pc: RTCPeerConnection) => {
+    if (typeof RTCRtpSender === 'undefined' || !RTCRtpSender.getCapabilities) return;
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps) return;
+    // VP9 first (best quality at constrained bitrate, hardware decode is universal),
+    // then VP8 (universal fallback), then H.264, then anything else.
+    const score = (mime: string): number => {
+      const m = mime.toLowerCase();
+      if (m === 'video/vp9') return 0;
+      if (m === 'video/vp8') return 1;
+      if (m === 'video/h264') return 2;
+      return 3;
+    };
+    const sorted = [...caps.codecs].sort((a, b) => score(a.mimeType) - score(b.mimeType));
+    for (const t of pc.getTransceivers()) {
+      if (t.sender.track?.kind !== 'video') continue;
+      try { t.setCodecPreferences(sorted); }
+      catch (e) { console.warn('setCodecPreferences failed', e); }
+    }
+  }, []);
+
   const tuneSenderEncodings = useCallback(async (pc: RTCPeerConnection) => {
     for (const sender of pc.getSenders()) {
       const kind = sender.track?.kind;
@@ -170,6 +202,9 @@ export default function RoomClient({ roomId }: { roomId: string }) {
         }
         if (kind === 'video') {
           params.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
+          // Hint to the OS / QoS-aware network gear that this is real-time
+          // video and should be prioritized over background traffic.
+          params.encodings[0].networkPriority = 'high';
           // Movies look better at full resolution with adaptive frame rate
           // than scaled-down at full frame rate.
           params.degradationPreference = 'maintain-resolution';
@@ -195,6 +230,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
       for (const track of stream.getTracks()) {
         try { pc.addTrack(track, stream); } catch (e) { console.warn('addTrack failed', e); }
       }
+      preferVideoCodecs(pc);
       pc.onicecandidate = (e) => {
         if (e.candidate) {
           sendWS({ type: 'signal', to: peerId, kind: 'ice', payload: e.candidate.toJSON() });
@@ -226,7 +262,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     } catch (e) {
       console.warn('offer failed', e);
     }
-  }, [captureLocalStream, sendWS, tuneSenderEncodings]);
+  }, [captureLocalStream, sendWS, tuneSenderEncodings, preferVideoCodecs]);
 
   const offerToAllGuests = useCallback(() => {
     const me = youRef.current?.peerId;
@@ -507,9 +543,15 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     };
   }, [nicknameSubmitted, roomId, nickname, handleSignal, offerToPeer, tearDownGuestPeer, tearDownHostPeers]);
 
-  // Auto-scroll chat
+  // Auto-scroll the chat container only — using scrollTop so the page itself
+  // never scrolls. If the user has scrolled up to read history, leave them be.
   useEffect(() => {
-    lastChatRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 80) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [chat.length]);
 
   // ---- Handlers ----
@@ -522,12 +564,43 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     setNicknameSubmitted(true);
   }
 
-  function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    // New file: drop existing PCs so we can re-offer with the new stream
-    tearDownHostPeers();
-    setLocalFile(file);
+  async function handlePickFile() {
+    setPickError(null);
+    try {
+      const { file, handle } = await pickVideoFile();
+      tearDownHostPeers();
+      setLocalFile(file);
+      if (handle) {
+        try { await saveHandle(roomId, handle); setSavedHandle(handle); } catch {}
+      }
+    } catch (err) {
+      // User cancelled or browser denied — silent unless it's a real error
+      if (err instanceof Error && err.message !== 'cancelled' && err.name !== 'AbortError') {
+        setPickError(err.message);
+      }
+    }
+  }
+
+  async function handleResumeFile() {
+    if (!savedHandle) return;
+    setPickError(null);
+    try {
+      const perm = savedHandle.requestPermission
+        ? await savedHandle.requestPermission({ mode: 'read' })
+        : 'granted';
+      if (perm !== 'granted') {
+        setPickError('Permission denied. Pick the file manually instead.');
+        return;
+      }
+      const file = await savedHandle.getFile();
+      tearDownHostPeers();
+      setLocalFile(file);
+    } catch (err) {
+      // File was moved/deleted/renamed — drop the stale handle
+      try { await clearHandle(roomId); } catch {}
+      setSavedHandle(null);
+      setPickError(err instanceof Error ? err.message : 'Could not re-open the file. Pick it manually.');
+    }
   }
 
   function onHostVideoCanPlay() {
@@ -636,8 +709,8 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   const guestWaiting = !isHost && (!roomVideo || !hasRemoteStream);
 
   return (
-    <div className="flex flex-1 flex-col lg:flex-row">
-      <main className="flex flex-1 flex-col gap-3 p-4">
+    <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+      <main className="flex shrink-0 flex-col gap-3 p-3 sm:p-4 lg:min-h-0 lg:flex-1 lg:shrink lg:overflow-y-auto">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2 text-sm">
             <span className={`inline-block h-2 w-2 rounded-full ${connected ? 'bg-emerald-500' : connecting ? 'bg-amber-500' : 'bg-red-500'}`} />
@@ -646,20 +719,12 @@ export default function RoomClient({ roomId }: { roomId: string }) {
             </span>
             {isHost && <span className="rounded bg-zinc-900 px-1.5 py-0.5 text-xs text-white dark:bg-zinc-100 dark:text-zinc-900">Host</span>}
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={copyLink}
-              className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-900"
-            >
-              {linkCopied ? 'Copied!' : 'Copy invite link'}
-            </button>
-            <button
-              onClick={() => setShowChat((s) => !s)}
-              className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium hover:bg-zinc-100 lg:hidden dark:border-zinc-700 dark:hover:bg-zinc-900"
-            >
-              {showChat ? 'Hide chat' : 'Show chat'}
-            </button>
-          </div>
+          <button
+            onClick={copyLink}
+            className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs font-medium hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-900"
+          >
+            {linkCopied ? 'Copied!' : 'Copy invite link'}
+          </button>
         </div>
 
         <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
@@ -674,7 +739,11 @@ export default function RoomClient({ roomId }: { roomId: string }) {
                 onCanPlay={onHostVideoCanPlay}
               />
             ) : (
-              <HostFilePicker onPick={handleFilePick} />
+              <HostFilePicker
+                onPick={handlePickFile}
+                savedHandle={savedHandle}
+                onResume={handleResumeFile}
+              />
             )
           ) : (
             <>
@@ -752,6 +821,12 @@ export default function RoomClient({ roomId }: { roomId: string }) {
           </div>
         )}
 
+        {pickError && (
+          <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+            {pickError}
+          </p>
+        )}
+
         <MembersList members={members} hostId={hostId} youId={you?.peerId ?? null} />
         {error && (
           <p className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
@@ -760,9 +835,9 @@ export default function RoomClient({ roomId }: { roomId: string }) {
         )}
       </main>
 
-      <aside className={`flex flex-col border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 lg:w-80 lg:border-l ${showChat ? 'flex' : 'hidden lg:flex'}`}>
-        <div className="border-b border-zinc-200 px-4 py-3 text-sm font-medium dark:border-zinc-800">Chat</div>
-        <div className="flex-1 overflow-y-auto px-4 py-3 text-sm">
+      <aside className="flex min-h-0 flex-1 flex-col border-t border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 lg:w-80 lg:flex-initial lg:border-l lg:border-t-0">
+        <div className="shrink-0 border-b border-zinc-200 px-4 py-3 text-sm font-medium dark:border-zinc-800">Chat</div>
+        <div ref={chatScrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 text-sm">
           {chat.length === 0 && (
             <p className="text-xs text-zinc-500">No messages yet. Say hi.</p>
           )}
@@ -796,10 +871,9 @@ export default function RoomClient({ roomId }: { roomId: string }) {
                 )}
               </li>
             ))}
-            <div ref={lastChatRef} />
           </ul>
         </div>
-        <form onSubmit={sendChat} className="flex gap-2 border-t border-zinc-200 p-3 dark:border-zinc-800">
+        <form onSubmit={sendChat} className="flex shrink-0 gap-2 border-t border-zinc-200 p-3 dark:border-zinc-800">
           <input
             value={chatDraft}
             onChange={(e) => setChatDraft(e.target.value)}
@@ -821,13 +895,35 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   );
 }
 
-function HostFilePicker({ onPick }: { onPick: (e: React.ChangeEvent<HTMLInputElement>) => void }) {
+function HostFilePicker({
+  onPick,
+  savedHandle,
+  onResume,
+}: {
+  onPick: () => void;
+  savedHandle: FileSystemFileHandle | null;
+  onResume: () => void;
+}) {
   return (
-    <label className="flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 px-6 text-center text-zinc-300 transition-colors hover:bg-zinc-900">
-      <input type="file" accept="video/*" onChange={onPick} className="hidden" />
-      <span className="text-base font-medium text-white">Pick a video file from this device</span>
-      <span className="text-xs text-zinc-400">As host, your playback streams to everyone in the room.</span>
-    </label>
+    <div className="flex h-full w-full flex-col items-center justify-center gap-4 px-6 text-center">
+      {savedHandle && (
+        <button
+          onClick={onResume}
+          className="rounded-md bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-emerald-500"
+        >
+          Resume streaming <span className="font-mono">{savedHandle.name}</span>
+        </button>
+      )}
+      <button
+        onClick={onPick}
+        className="rounded-md border border-zinc-600 px-4 py-2 text-sm font-medium text-zinc-200 hover:bg-zinc-800"
+      >
+        {savedHandle ? 'Pick a different file' : 'Pick a video file from this device'}
+      </button>
+      <span className="max-w-sm text-xs text-zinc-400">
+        As host, your playback streams to everyone in the room.
+      </span>
+    </div>
   );
 }
 
