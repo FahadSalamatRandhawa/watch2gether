@@ -55,6 +55,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   const hostIdRef = useRef<string | null>(null);
   const membersRef = useRef<Member[]>([]);
   const roomVideoRef = useRef<VideoMeta | null>(null);
+  const localFileRef = useRef<File | null>(null);
 
   const [nickname, setNickname] = useState('');
   const [nicknameSubmitted, setNicknameSubmitted] = useState(false);
@@ -91,6 +92,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   useEffect(() => { hostIdRef.current = hostId; }, [hostId]);
   useEffect(() => { membersRef.current = members; }, [members]);
   useEffect(() => { roomVideoRef.current = roomVideo; }, [roomVideo]);
+  useEffect(() => { localFileRef.current = localFile; }, [localFile]);
 
   useEffect(() => {
     const saved = typeof window !== 'undefined' ? localStorage.getItem('w2g:nickname') || '' : '';
@@ -446,7 +448,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
         let msg: ServerMsg;
         try { msg = JSON.parse(ev.data); } catch { return; }
         switch (msg.type) {
-          case 'state':
+          case 'state': {
             setYou(msg.you);
             youRef.current = msg.you;
             setMembers(msg.room.members);
@@ -456,7 +458,29 @@ export default function RoomClient({ roomId }: { roomId: string }) {
             setRoomVideo(msg.room.video);
             roomVideoRef.current = msg.room.video;
             setChat(msg.room.chat);
+
+            // Reconnect recovery: if I'm host and already have an active stream,
+            // re-publish video metadata and re-offer to every other peer. Handles
+            // the case where the WS dropped briefly while I was streaming.
+            const meIsHost = msg.you.peerId === msg.room.hostId;
+            const stream = localStreamRef.current;
+            if (meIsHost && stream && stream.active) {
+              const v = videoRef.current;
+              const f = localFileRef.current;
+              if (v && f) {
+                sendWS({
+                  type: 'set-video',
+                  name: f.name,
+                  size: f.size,
+                  durationMs: Math.round((v.duration || 0) * 1000),
+                });
+              }
+              for (const m of msg.room.members) {
+                if (m.peerId !== msg.you.peerId) offerToPeer(m.peerId);
+              }
+            }
             break;
+          }
           case 'video':
             setRoomVideo(msg.video);
             roomVideoRef.current = msg.video;

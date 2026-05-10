@@ -102,10 +102,11 @@ export default class WatchRoom implements Party.Server {
     await this.pushSystemChat(`${member.nickname} left`);
 
     if (this.members.size === 0) {
+      // Room is temporarily empty. Keep video metadata alive so a host who
+      // just had a brief disconnect can come back without losing state.
+      // The TTL alarm wipes everything 24h later if nobody returns.
       this.hostId = null;
-      this.video = null;
       await this.room.storage.delete('hostId');
-      await this.room.storage.delete('video');
       await this.room.storage.setAlarm(Date.now() + ROOM_TTL_MS);
     } else if (wasHost) {
       const hadVideo = !!this.video;
