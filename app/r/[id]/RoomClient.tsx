@@ -35,6 +35,41 @@ const VIDEO_MAX_BITRATE = 8_000_000; // 8 Mbps ceiling; WebRTC adapts down per p
 const AUDIO_MAX_BITRATE = 128_000;   // 128 kbps Opus
 const GUEST_PLAYOUT_DELAY_S = 1.5;   // 1.5s jitter buffer on guest side; absorbs more network jitter
 
+// Force Opus to negotiate stereo with a music-friendly bitrate. Default WebRTC
+// audio is mono and voice-tuned; on a stereo movie mix the mono downmix cancels
+// the phantom-center, so the receiver hears music but no dialogue ("karaoke
+// effect"). Both offer and answer SDP must declare stereo for it to take effect.
+function enableStereoOpus(sdp: string | undefined): string {
+  if (!sdp) return '';
+  const opusPt = sdp.match(/a=rtpmap:(\d+)\s+opus/i)?.[1];
+  if (!opusPt) return sdp;
+  const wanted: Record<string, string> = {
+    stereo: '1',
+    'sprop-stereo': '1',
+    maxaveragebitrate: '128000',
+    maxplaybackrate: '48000',
+    cbr: '0',
+    usedtx: '0',
+  };
+  const fmtpRe = new RegExp(`a=fmtp:${opusPt}\\s+([^\\r\\n]+)`, 'i');
+  const m = sdp.match(fmtpRe);
+  if (m) {
+    const params = new Map<string, string>();
+    for (const part of m[1].split(';')) {
+      const [k, v] = part.split('=').map((s) => s.trim());
+      if (k) params.set(k, v ?? '');
+    }
+    for (const [k, v] of Object.entries(wanted)) params.set(k, v);
+    const merged = [...params.entries()].map(([k, v]) => (v ? `${k}=${v}` : k)).join(';');
+    return sdp.replace(fmtpRe, `a=fmtp:${opusPt} ${merged}`);
+  }
+  const extras = Object.entries(wanted).map(([k, v]) => `${k}=${v}`).join(';');
+  return sdp.replace(
+    new RegExp(`(a=rtpmap:${opusPt}\\s+opus[^\\r\\n]*\\r?\\n)`, 'i'),
+    `$1a=fmtp:${opusPt} ${extras}\r\n`,
+  );
+}
+
 export default function RoomClient({ roomId }: { roomId: string }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -79,6 +114,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   const [localFileURL, setLocalFileURL] = useState<string | null>(null);
   const [savedHandle, setSavedHandle] = useState<FileSystemFileHandle | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
+  const [codecUnsupported, setCodecUnsupported] = useState(false);
 
   // Guest-only
   const [hasRemoteStream, setHasRemoteStream] = useState(false);
@@ -133,6 +169,7 @@ export default function RoomClient({ roomId }: { roomId: string }) {
 
   // Host: when localFile changes, build a fresh object URL and prepare for streaming
   useEffect(() => {
+    setCodecUnsupported(false);
     if (!localFile) {
       setLocalFileURL(null);
       return;
@@ -252,14 +289,15 @@ export default function RoomClient({ roomId }: { roomId: string }) {
     }
     try {
       const offer = await pc!.createOffer({ iceRestart: !!opts.iceRestart });
-      await pc!.setLocalDescription(offer);
+      const stereoSdp = enableStereoOpus(offer.sdp);
+      await pc!.setLocalDescription({ type: offer.type, sdp: stereoSdp });
       // Apply encoding tuning AFTER local description so parameters stick.
       await tuneSenderEncodings(pc!);
       sendWS({
         type: 'signal',
         to: peerId,
         kind: 'offer',
-        payload: { type: offer.type, sdp: offer.sdp },
+        payload: { type: offer.type, sdp: stereoSdp },
       });
     } catch (e) {
       console.warn('offer failed', e);
@@ -378,12 +416,13 @@ export default function RoomClient({ roomId }: { roomId: string }) {
         }
         pendingIceRef.current = [];
         const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        const stereoSdp = enableStereoOpus(answer.sdp);
+        await pc.setLocalDescription({ type: answer.type, sdp: stereoSdp });
         sendWS({
           type: 'signal',
           to: msg.from,
           kind: 'answer',
-          payload: { type: answer.type, sdp: answer.sdp },
+          payload: { type: answer.type, sdp: stereoSdp },
         });
       } catch (e) {
         console.warn('offer handling failed', e);
@@ -630,9 +669,17 @@ export default function RoomClient({ roomId }: { roomId: string }) {
   function onHostVideoCanPlay() {
     if (!isHost) return;
     if (!localFile) return;
+    const video = videoRef.current;
+    // Browser couldn't decode the video track (HEVC/H.265, AV1 on old browsers,
+    // etc). Audio still plays but no frames are produced, so videoWidth stays 0.
+    // Bail before capturing — a black stream is worse than a clear error.
+    if (video && video.videoWidth === 0 && video.videoHeight === 0) {
+      setCodecUnsupported(true);
+      return;
+    }
+    setCodecUnsupported(false);
     const stream = captureLocalStream();
     if (!stream) return;
-    const video = videoRef.current;
     const durationMs = video ? Math.round((video.duration || 0) * 1000) : 0;
     sendWS({
       type: 'set-video',
@@ -754,14 +801,42 @@ export default function RoomClient({ roomId }: { roomId: string }) {
         <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
           {isHost ? (
             localFileURL ? (
-              <video
-                ref={videoRef}
-                src={localFileURL}
-                controls
-                playsInline
-                className="h-full w-full"
-                onCanPlay={onHostVideoCanPlay}
-              />
+              <>
+                <video
+                  ref={videoRef}
+                  src={localFileURL}
+                  controls
+                  playsInline
+                  className="h-full w-full"
+                  onCanPlay={onHostVideoCanPlay}
+                />
+                {codecUnsupported && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/85 px-6 text-center">
+                    <span className="text-base font-medium text-white">
+                      Your browser can&apos;t decode this video&apos;s codec.
+                    </span>
+                    <span className="max-w-md text-xs text-zinc-300">
+                      The file is likely HEVC / H.265 (e.g. <span className="font-mono">x265</span>).
+                      Audio plays but the picture stays black. Install the Windows HEVC extension
+                      and reload, or pick an H.264 / VP9 file instead.
+                    </span>
+                    <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+                      <a
+                        href="ms-windows-store://pdp/?productid=9n4wgh0z6vhq"
+                        className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                      >
+                        Install HEVC extension (free)
+                      </a>
+                      <button
+                        onClick={() => { tearDownHostPeers(); setLocalFile(null); }}
+                        className="rounded-md border border-zinc-500 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800"
+                      >
+                        Pick another file
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
             ) : (
               <HostFilePicker
                 onPick={handlePickFile}
